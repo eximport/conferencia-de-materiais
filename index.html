@@ -584,46 +584,69 @@ function toast(msg, ok){
   setTimeout(()=>t.remove(), ok ? 2200 : 4500);
 }
 
+function withTimeout(promise, ms, msg){
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(msg || `Tempo esgotado (mais de ${Math.round(ms/1000)}s) — verifique a conexão.`)), ms);
+    promise.then(
+      v => { clearTimeout(t); resolve(v); },
+      e => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
 /* ---------------- Home / lista de pedidos ---------------- */
 async function loadPedidosList(){
   const noticeEl = document.getElementById('storage-notice');
-  await window.firebaseReadyPromise;
-  if(!window.__firebaseOk){
-    noticeEl.innerHTML = `<div class="card" style="border-color:var(--danger);font-size:12.5px;color:var(--muted)">
-      ⚠️ Sem conexão com a nuvem agora. Os pedidos estão sendo salvos <strong style="color:var(--text)">só neste aparelho</strong> como backup até a conexão voltar.
-    </div>`;
-  } else {
-    noticeEl.innerHTML = `<div class="card" style="border-color:var(--ok);font-size:12.5px;color:var(--muted)">
-      ☁️ Conectado à nuvem — os pedidos ficam disponíveis em qualquer aparelho.
-    </div>`;
-  }
   const el = document.getElementById('pedidos-list');
   el.innerHTML = '<div class="empty">Carregando…</div>';
-  const keys = await stListPrefix('pedido:');
-  if(!keys.length){
-    el.innerHTML = '<div class="empty">Nenhum pedido cadastrado ainda.<br>Toque em "Novo pedido" para começar.</div>' + newPedidoBtn();
-    return;
+  try{
+    await withTimeout(window.firebaseReadyPromise, 12000, 'A conexão com a nuvem demorou demais para responder.');
+
+    if(!window.__firebaseOk){
+      noticeEl.innerHTML = `<div class="card" style="border-color:var(--danger);font-size:12.5px;color:var(--muted)">
+        ⚠️ Sem conexão com a nuvem agora. Os pedidos estão sendo salvos <strong style="color:var(--text)">só neste aparelho</strong> como backup até a conexão voltar.
+      </div>`;
+    } else {
+      noticeEl.innerHTML = `<div class="card" style="border-color:var(--ok);font-size:12.5px;color:var(--muted)">
+        ☁️ Conectado à nuvem — os pedidos ficam disponíveis em qualquer aparelho.
+      </div>`;
+    }
+
+    const keys = await withTimeout(stListPrefix('pedido:'), 12000);
+    if(!keys.length){
+      el.innerHTML = '<div class="empty">Nenhum pedido cadastrado ainda.<br>Toque em "Novo pedido" para começar.</div>' + newPedidoBtn();
+      return;
+    }
+    const pedidos = [];
+    for(const k of keys){
+      try{
+        const numero = k.replace('pedido:','');
+        const data = await withTimeout(stGet(k), 12000);
+        if(data && Array.isArray(data.itens)) pedidos.push({numero, data});
+      }catch(errItem){
+        console.error('Falha ao carregar um pedido, pulando', k, errItem);
+      }
+    }
+    pedidos.sort((a,b)=> a.numero.localeCompare(b.numero, undefined, {numeric:true}));
+    let html = '';
+    for(const p of pedidos){
+      const totalItens = p.data.itens.length;
+      html += `<div class="pedido-row">
+        <div style="flex:1;cursor:pointer" onclick="abrirPedidoMenu('${p.numero}')">
+          <div class="pedido-num">Pedido ${escapeHtml(p.numero)}</div>
+          <div class="pedido-meta">${totalItens} item${totalItens===1?'':'s'}</div>
+        </div>
+        <button class="nav-btn" style="padding:10px 12px" onclick="event.stopPropagation(); requireEditorAuth(function(){editarPedidoExistente('${p.numero}')})">✏️</button>
+        <div class="chevron" style="cursor:pointer" onclick="abrirPedidoMenu('${p.numero}')">›</div>
+      </div>`;
+    }
+    el.innerHTML = html + newPedidoBtn();
+  }catch(err){
+    console.error('Falha ao carregar lista de pedidos', err);
+    const motivo = (err && err.message) ? err.message : 'Erro de conexão desconhecido.';
+    el.innerHTML = `<div class="empty">Não foi possível carregar os pedidos agora.<br><span style="font-size:11.5px">${escapeHtml(motivo)}</span></div>
+      <button class="btn btn-secondary" style="margin-top:10px" onclick="loadPedidosList()">🔄 Tentar novamente</button>` + newPedidoBtn();
   }
-  let html = '';
-  const pedidos = [];
-  for(const k of keys){
-    const numero = k.replace('pedido:','');
-    const data = await stGet(k);
-    if(data) pedidos.push({numero, data});
-  }
-  pedidos.sort((a,b)=> a.numero.localeCompare(b.numero, undefined, {numeric:true}));
-  for(const p of pedidos){
-    const totalItens = p.data.itens.length;
-    html += `<div class="pedido-row">
-      <div style="flex:1;cursor:pointer" onclick="abrirPedidoMenu('${p.numero}')">
-        <div class="pedido-num">Pedido ${escapeHtml(p.numero)}</div>
-        <div class="pedido-meta">${totalItens} item${totalItens===1?'':'s'}</div>
-      </div>
-      <button class="nav-btn" style="padding:10px 12px" onclick="event.stopPropagation(); requireEditorAuth(function(){editarPedidoExistente('${p.numero}')})">✏️</button>
-      <div class="chevron" style="cursor:pointer" onclick="abrirPedidoMenu('${p.numero}')">›</div>
-    </div>`;
-  }
-  el.innerHTML = html + newPedidoBtn();
 }
 function newPedidoBtn(){
   return `<button class="btn btn-secondary" style="margin-top:8px" onclick="requireEditorAuth(novoPedido)">+ Novo pedido</button>`;
