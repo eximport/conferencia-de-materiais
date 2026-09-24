@@ -490,6 +490,122 @@ function normalizeNumero(str){
   return (str || '').trim().replace(/["'\\/]/g, '').replace(/\s+/g, '-');
 }
 
+/* ---------------- Pedidos: cada item (com foto) fica em documento próprio, ---------------- */
+/* ---------------- para não bater no limite de 1MB por documento do Firestore ---------------- */
+
+async function savePedido(numeroRaw, itens){
+  const numero = safeDocId(numeroRaw);
+  await window.firebaseReadyPromise;
+  if(window.__firebaseOk){
+    try{
+      const itensColRef = window.__fs.collection(window.__db, 'pedidos', numero, 'itens');
+      const existingSnap = await window.__fs.getDocs(itensColRef);
+      const dels = [];
+      existingSnap.forEach(d => dels.push(window.__fs.deleteDoc(d.ref)));
+      await Promise.all(dels);
+
+      const writes = itens.map((item, idx) => {
+        const itemRef = window.__fs.doc(window.__db, 'pedidos', numero, 'itens', 'item_'+idx);
+        return window.__fs.setDoc(itemRef, {codigo: item.codigo, quantidade: item.quantidade, foto: item.foto || '', ordem: idx});
+      });
+      await Promise.all(writes);
+
+      const pedidoRef = window.__fs.doc(window.__db, 'pedidos', numero);
+      await window.__fs.setDoc(pedidoRef, {itensCount: itens.length, atualizadoEm: new Date().toISOString()});
+
+      try{ localStorage.setItem(LOCAL_NS+'pedido:'+numero, JSON.stringify({itens})); }catch(_){}
+      return {success:true};
+    }catch(e){
+      console.error('Firestore savePedido falhou', e);
+      let salvouLocal = false;
+      try{ localStorage.setItem(LOCAL_NS+'pedido:'+numero, JSON.stringify({itens})); salvouLocal = true; }catch(_){}
+      const motivo = (e && e.message) ? e.message : String(e);
+      return {success:false, error: salvouLocal
+        ? `Não salvou na nuvem (${motivo}) — foi salvo só neste aparelho como backup.`
+        : `Não foi possível salvar: ${motivo}`};
+    }
+  }
+  try{
+    localStorage.setItem(LOCAL_NS+'pedido:'+numero, JSON.stringify({itens}));
+    return {success:true};
+  }catch(e){
+    return {success:false, error: (e && e.message) ? e.message : String(e)};
+  }
+}
+
+async function getPedido(numeroRaw){
+  const numero = safeDocId(numeroRaw);
+  await window.firebaseReadyPromise;
+  if(window.__firebaseOk){
+    try{
+      const itensColRef = window.__fs.collection(window.__db, 'pedidos', numero, 'itens');
+      const snap = await window.__fs.getDocs(itensColRef);
+      const itens = [];
+      snap.forEach(d => itens.push(d.data()));
+      if(itens.length){
+        itens.sort((a,b) => (a.ordem||0) - (b.ordem||0));
+        return {itens: itens.map(it => ({codigo: it.codigo, quantidade: it.quantidade, foto: it.foto || ''}))};
+      }
+      // compatibilidade com pedidos salvos no formato antigo (tudo em um só documento)
+      const pedidoRef = window.__fs.doc(window.__db, 'pedidos', numero);
+      const psnap = await window.__fs.getDoc(pedidoRef);
+      if(psnap.exists()){
+        const d = psnap.data();
+        if(d && Array.isArray(d.itens)) return {itens: d.itens};
+        if(d && d.data && Array.isArray(d.data.itens)) return {itens: d.data.itens};
+      }
+      return null;
+    }catch(e){
+      console.error('Firestore getPedido falhou, tentando backup local', e);
+    }
+  }
+  try{
+    const raw = localStorage.getItem(LOCAL_NS+'pedido:'+numero);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+
+async function deletePedido(numeroRaw){
+  const numero = safeDocId(numeroRaw);
+  await window.firebaseReadyPromise;
+  if(window.__firebaseOk){
+    try{
+      const itensColRef = window.__fs.collection(window.__db, 'pedidos', numero, 'itens');
+      const snap = await window.__fs.getDocs(itensColRef);
+      const dels = [];
+      snap.forEach(d => dels.push(window.__fs.deleteDoc(d.ref)));
+      await Promise.all(dels);
+      const pedidoRef = window.__fs.doc(window.__db, 'pedidos', numero);
+      await window.__fs.deleteDoc(pedidoRef);
+    }catch(e){ console.error('Firestore deletePedido falhou', e); }
+  }
+  try{ localStorage.removeItem(LOCAL_NS+'pedido:'+numero); }catch(e){}
+}
+
+async function listPedidoNumeros(){
+  await window.firebaseReadyPromise;
+  if(window.__firebaseOk){
+    try{
+      const colRef = window.__fs.collection(window.__db, 'pedidos');
+      const snap = await window.__fs.getDocs(colRef);
+      const numeros = [];
+      snap.forEach(d => numeros.push(d.id));
+      return numeros;
+    }catch(e){
+      console.error('Firestore listPedidoNumeros falhou, tentando backup local', e);
+    }
+  }
+  try{
+    const numeros = [];
+    const prefix = LOCAL_NS+'pedido:';
+    for(let i=0;i<localStorage.length;i++){
+      const k = localStorage.key(i);
+      if(k && k.indexOf(prefix) === 0) numeros.push(k.substring(prefix.length));
+    }
+    return numeros;
+  }catch(e){ return []; }
+}
+
 /* ---------------- Global state ---------------- */
 let editingPedidoOriginalNumero = null; // quando editando pedido já existente
 let conf = null; // {numero, itens:[...], indice}
@@ -612,19 +728,18 @@ async function loadPedidosList(){
       </div>`;
     }
 
-    const keys = await withTimeout(stListPrefix('pedido:'), 12000);
-    if(!keys.length){
+    const numeros = await withTimeout(listPedidoNumeros(), 12000);
+    if(!numeros.length){
       el.innerHTML = '<div class="empty">Nenhum pedido cadastrado ainda.<br>Toque em "Novo pedido" para começar.</div>' + newPedidoBtn();
       return;
     }
     const pedidos = [];
-    for(const k of keys){
+    for(const numero of numeros){
       try{
-        const numero = k.replace('pedido:','');
-        const data = await withTimeout(stGet(k), 12000);
+        const data = await withTimeout(getPedido(numero), 12000);
         if(data && Array.isArray(data.itens)) pedidos.push({numero, data});
       }catch(errItem){
-        console.error('Falha ao carregar um pedido, pulando', k, errItem);
+        console.error('Falha ao carregar um pedido, pulando', numero, errItem);
       }
     }
     pedidos.sort((a,b)=> a.numero.localeCompare(b.numero, undefined, {numeric:true}));
@@ -671,7 +786,7 @@ function novoPedido(){
 
 async function editarPedidoExistente(numero){
   editingPedidoOriginalNumero = numero;
-  const data = await stGet('pedido:'+numero);
+  const data = await getPedido(numero);
   document.getElementById('cadastro-title').textContent = 'Editar pedido';
   document.getElementById('input-pedido-numero').value = numero;
   document.getElementById('itens-edit-list').innerHTML = '';
@@ -760,10 +875,10 @@ async function salvarPedido(){
 
   // se o número mudou durante edição, remove o registro antigo
   if(editingPedidoOriginalNumero && editingPedidoOriginalNumero !== numero){
-    await stDelete('pedido:'+editingPedidoOriginalNumero);
+    await deletePedido(editingPedidoOriginalNumero);
   }
 
-  const result = await stSet('pedido:'+numero, {itens});
+  const result = await savePedido(numero, itens);
   if(result && result.success){
     toast('Pedido '+numero+' salvo com sucesso', true);
     showView('lista');
@@ -777,7 +892,7 @@ async function salvarPedido(){
 function confirmDeletePedido(){
   if(!editingPedidoOriginalNumero) return;
   if(confirm('Excluir o pedido '+editingPedidoOriginalNumero+'? Essa ação não pode ser desfeita.')){
-    stDelete('pedido:'+editingPedidoOriginalNumero).then(()=>{
+    deletePedido(editingPedidoOriginalNumero).then(()=>{
       toast('Pedido excluído', true);
       showView('lista');
     });
@@ -788,7 +903,7 @@ function confirmDeletePedido(){
 async function iniciarConferencia(){
   const numero = normalizeNumero(document.getElementById('input-conf-numero').value);
   if(!numero){ toast('Informe o número do pedido'); return; }
-  const data = await stGet('pedido:'+numero);
+  const data = await getPedido(numero);
   if(!data || !data.itens.length){
     toast('Pedido não encontrado. Cadastre-o primeiro.');
     return;
@@ -937,13 +1052,13 @@ function salvarConferenciaEVoltar(){
 /* ---------------- Backup: exportar / importar ---------------- */
 async function exportarBackup(){
   toast('Preparando backup…');
-  const pedidoKeys = await stListPrefix('pedido:');
+  const numeros = await listPedidoNumeros();
   const confKeys = await stListPrefix('conferencia:');
   const dados = { pedidos: {}, conferencias: {}, exportadoEm: new Date().toISOString() };
 
-  for(const k of pedidoKeys){
-    const v = await stGet(k);
-    if(v) dados.pedidos[k] = v;
+  for(const numero of numeros){
+    const v = await getPedido(numero);
+    if(v) dados.pedidos['pedido:'+numero] = v;
   }
   for(const k of confKeys){
     const v = await stGet(k);
@@ -993,7 +1108,9 @@ function importarBackup(evt){
     toast('Importando…');
     let ok = 0, falhas = 0;
     for(const [key, value] of Object.entries(dados.pedidos)){
-      const r = await stSet(key, value);
+      const numero = key.replace('pedido:','');
+      const itens = Array.isArray(value.itens) ? value.itens : [];
+      const r = await savePedido(numero, itens);
       if(r && r.success) ok++; else falhas++;
     }
     if(dados.conferencias){
